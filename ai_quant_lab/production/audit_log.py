@@ -44,7 +44,7 @@ class DecisionLog:
     def __post_init__(self) -> None:
         self.path = Path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(exist_ok=True)
+        self.path.touch(exist_ok=True, mode=0o600)
 
     def append(self, record: DecisionRecord) -> None:
         with self.path.open("a", encoding="utf-8") as fh:

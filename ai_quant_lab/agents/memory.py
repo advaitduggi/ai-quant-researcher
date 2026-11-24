@@ -70,9 +70,16 @@ class ResearchMemory:
     """
 
     def __init__(self, path: str | Path) -> None:
+        raw = str(path)
+        if "\x00" in raw or raw.startswith(("file:", "http:", "https:")):
+            raise ValueError(f"Invalid memory DB path: {raw!r}")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            self.path.chmod(0o600)  # trial code/rationales: owner-only
+        except OSError:
+            pass
         self._conn.row_factory = sqlite3.Row
         for statement in _SCHEMA.strip().split(";"):
             if statement.strip():
