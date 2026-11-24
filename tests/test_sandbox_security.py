@@ -51,3 +51,66 @@ def test_timeout_is_hard_even_if_exception_swallowed():
     with pytest.raises(SandboxError, match="timeout"):
         run_strategy(src, PX, timeout_seconds=1)
 
+
+
+MORE_ESCAPES = {
+    "match_class_dunder": (
+        "def strategy(p):\n    match p:\n        case pd.Series(__class__=c):\n            return c\n    return p"
+    ),
+    "from_import_reader": "from pandas import read_pickle\ndef strategy(p):\n    return p",
+    "import_submodule": "import numpy.ctypeslib\ndef strategy(p):\n    return p",
+    "module_os_attr": "def strategy(p):\n    return np.os",
+    "frame_walk": "def strategy(p):\n    g = (x for x in [1])\n    return g.gi_frame",
+    "bytes_dunder": "def strategy(p):\n    return b'__class__'",
+    "huge_source": "x = 1\n" * 100_000,
+    "deep_nesting": "def strategy(p):\n    return " + "(" * 5000 + "p" + ")" * 5000,
+}
+
+
+@pytest.mark.parametrize("name", MORE_ESCAPES)
+def test_more_escapes_blocked(name):
+    with pytest.raises(SandboxError):
+        run_strategy(MORE_ESCAPES[name], PX)
+
+
+def test_worker_does_not_inherit_secrets(monkeypatch):
+    """The worker is launched with a minimal env: no API keys or other parent vars."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-secret")
+    monkeypatch.setenv("MY_PRIVATE_VALUE", "leak-me")
+    from ai_quant_lab.orchestrator import sandbox
+
+    captured = {}
+    real_popen = sandbox.subprocess.Popen
+
+    def spy(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", spy)
+    run_strategy("def strategy(p):\n    return p * 0.0", PX)
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "MY_PRIVATE_VALUE" not in captured["env"]
+
+
+def test_result_is_pickle_free_numeric_only():
+    """A strategy returning non-numeric junk is rejected, not unpickled."""
+    src = "def strategy(p):\n    return pd.Series(['a'] * len(p), index=p.index)"
+    with pytest.raises(SandboxError):
+        run_strategy(src, PX)
+
+
+def test_roundtrip_preserves_index_and_tz():
+    idx = pd.date_range("2020-01-01", periods=20, tz="America/New_York")
+    px = pd.Series(np.arange(20.0) + 100, index=idx, name="close")
+    out = run_strategy("def strategy(p):\n    return (p > p.mean()).astype(float)", px)
+    assert out.positions.index.equals(idx)
+    assert out.positions.name == "close"
+
+
+def test_settings_does_not_leak_api_key():
+    from ai_quant_lab.config import Settings
+
+    s = Settings(anthropic_api_key="sk-ant-secret-123")
+    assert "sk-ant-secret-123" not in repr(s)
+    assert "sk-ant-secret-123" not in str(s.model_dump())
+    assert s.require_api_key() == "sk-ant-secret-123"

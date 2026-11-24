@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 def _read_env(name: str, default: str) -> str:
@@ -19,8 +19,13 @@ def _read_env(name: str, default: str) -> str:
 class Settings(BaseModel):
     """Runtime configuration. Loaded once at import time; override per-test via `Settings(...)`."""
 
-    anthropic_api_key: str | None = Field(
-        default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY"),
+    anthropic_api_key: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["ANTHROPIC_API_KEY"])
+            if os.environ.get("ANTHROPIC_API_KEY")
+            else None
+        ),
+        repr=False,
         description="Optional. Examples 01-05 run without it.",
     )
     model: str = Field(
@@ -68,7 +73,7 @@ class Settings(BaseModel):
                 "Examples 06-08 and `python -m ai_quant_lab.run` need a key. "
                 "Run `cp .env.example .env` and fill it in, or `export ANTHROPIC_API_KEY=...`."
             )
-        return self.anthropic_api_key
+        return self.anthropic_api_key.get_secret_value()
 
 
 settings = Settings()

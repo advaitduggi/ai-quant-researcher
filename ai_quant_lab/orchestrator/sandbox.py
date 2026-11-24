@@ -1,27 +1,35 @@
 """Strategy sandbox: execute LLM-generated code with limited surface area.
 
-This is defense in depth, NOT a hard security boundary. In-process Python
-cannot be made fully safe against hostile code. Layers applied here:
-    - Import whitelist.
-    - AST screening: no dunder/underscore attribute access (blocks the
-      `().__class__.__base__.__subclasses__()` escape), no denylisted names,
-      and no numpy/pandas file/pickle/IO or module-internals attributes.
+This is defense in depth, NOT a hard security boundary. Python cannot be made
+fully safe against hostile code. Layers applied here:
+    - Source-size cap and AST screening: import whitelist, no dunder/underscore
+      attribute access (blocks the `().__class__.__base__.__subclasses__()`
+      escape, including via `match` class patterns), no denylisted names, no
+      frame/traceback introspection, and no numpy/pandas file/pickle/IO or
+      module-internals attributes.
     - Restricted builtins (no open/eval/exec/getattr/type/__import__).
-    - Execution in a forked child process: hard-killed on timeout, API keys
-      scrubbed from its environment, CPU/file-size/core (and, on Linux,
-      memory) rlimits applied.
+    - Execution in a *fresh interpreter* (`python -I`, new session) that does
+      not inherit the parent's memory or environment (API keys never reach it),
+      with CPU/file-size/core (and, on Linux, memory) rlimits and a hard
+      wall-clock kill of the whole process group.
+    - Pickle-free IPC: data goes in and out as plain numeric arrays (`.npz`,
+      allow_pickle=False), so a compromised worker cannot attack the parent
+      through deserialization.
 
 Treat model output as untrusted: for anything beyond local research, run the
-whole process in a container / VM with no secrets (ANTHROPIC_API_KEY is in
-this process's environment) or move execution to a subprocess with
-resource.setrlimit + seccomp.
+whole process in a container / VM with no secrets and add seccomp / network
+isolation.
 """
 
 from __future__ import annotations
 
 import ast
+import io
 import os
+import signal
+import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +59,9 @@ _ALLOWED_IMPORTS: frozenset[str] = frozenset(
     }
 )
 
+MAX_SOURCE_CHARS = 100_000
+_MAX_OUTPUT_BYTES = 512 * 1024 * 1024
+
 
 def run_strategy(
     source: str,
@@ -76,36 +87,27 @@ def run_strategy(
         SandboxError: on disallowed imports, missing function, exceptions,
             shape mismatch, or timeout.
     """
+    if not isinstance(price_data, (pd.Series, pd.DataFrame)):
+        raise SandboxError(f"Unsupported price_data type: {type(price_data).__name__}")
     _validate_source(source)
 
     import time
 
     start = time.perf_counter()
-    positions = _run_isolated(source, price_data, timeout_seconds)
+    values = _run_isolated(source, price_data, timeout_seconds)
     elapsed = time.perf_counter() - start
 
-    expected_type = type(price_data).__name__
     if isinstance(price_data, pd.Series):
-        if not isinstance(positions, pd.Series):
-            raise SandboxError(
-                f"Single-asset strategy must return a Series, got {type(positions).__name__}."
-            )
-        if not positions.index.equals(price_data.index):
-            raise SandboxError("Strategy returned a Series with a different index.")
-        return SandboxResult(positions=positions.fillna(0.0), elapsed_seconds=elapsed)
-
-    if isinstance(price_data, pd.DataFrame):
-        if not isinstance(positions, pd.DataFrame):
-            raise SandboxError(
-                f"Cross-sectional strategy must return a DataFrame, got {type(positions).__name__}."
-            )
-        if not positions.index.equals(price_data.index):
-            raise SandboxError("Strategy returned a DataFrame with a different index.")
-        if not positions.columns.equals(price_data.columns):
-            raise SandboxError("Strategy returned a DataFrame with different columns.")
-        return SandboxResult(positions=positions.fillna(0.0), elapsed_seconds=elapsed)
-
-    raise SandboxError(f"Unsupported price_data type: {expected_type}")
+        if values.shape != (len(price_data),):
+            raise SandboxError("Strategy returned a Series with a different shape.")
+        positions: pd.Series | pd.DataFrame = pd.Series(
+            values, index=price_data.index, name=price_data.name
+        )
+    else:
+        if values.shape != price_data.shape:
+            raise SandboxError("Strategy returned a DataFrame with a different shape.")
+        positions = pd.DataFrame(values, index=price_data.index, columns=price_data.columns)
+    return SandboxResult(positions=positions.fillna(0.0), elapsed_seconds=elapsed)
 
 
 _FORBIDDEN_NAMES: frozenset[str] = frozenset(
@@ -126,10 +128,14 @@ _FORBIDDEN_ATTRS: frozenset[str] = frozenset(
         "lib", "core", "ctypeslib", "f2py", "testing", "distutils", "compat",
         "util", "io", "api", "errors", "plotting", "show_versions", "eval",
         "query", "system", "popen", "run", "Popen", "format", "format_map",
-        "mro", "gi_frame", "gi_code", "f_globals", "f_builtins", "func_globals",
+        "mro", "os", "sys", "subprocess", "builtins", "importlib", "ctypes",
+        "pickle", "shutil", "socket", "mmap", "frombuffer_", "with_traceback",
     }
 )
-_FORBIDDEN_ATTR_PREFIXES: tuple[str, ...] = ("read_", "to_", "_")
+# Frame / generator / traceback / code-object introspection, I/O readers, privates.
+_FORBIDDEN_ATTR_PREFIXES: tuple[str, ...] = (
+    "read_", "to_", "_", "f_", "gi_", "cr_", "ag_", "tb_", "co_", "func_",
+)
 # `to_` is mostly I/O (to_csv, to_pickle, to_sql, ...) but a few are harmless
 # conversions that strategies legitimately use.
 _ALLOWED_TO_ATTRS: frozenset[str] = frozenset(
@@ -138,130 +144,169 @@ _ALLOWED_TO_ATTRS: frozenset[str] = frozenset(
 )
 
 
+def _check_attr_name(attr: str) -> None:
+    if attr in _ALLOWED_TO_ATTRS:
+        return
+    if attr in _FORBIDDEN_ATTRS or attr.startswith(_FORBIDDEN_ATTR_PREFIXES):
+        raise SandboxError(f"Disallowed attribute access: .{attr}")
+
+
 def _validate_source(source: str) -> None:
     """Reject disallowed imports and escape-prone constructs before exec."""
+    if len(source) > MAX_SOURCE_CHARS:
+        raise SandboxError(f"Strategy source too large (> {MAX_SOURCE_CHARS} chars).")
+    if "\x00" in source:
+        raise SandboxError("Strategy source contains a NUL byte.")
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
         raise SandboxError(f"Syntax error: {exc}") from exc
+    except (RecursionError, MemoryError, ValueError) as exc:
+        raise SandboxError(f"Strategy source could not be parsed safely: {type(exc).__name__}") from exc
 
-    for node in ast.walk(tree):
+    try:
+        nodes = list(ast.walk(tree))
+    except RecursionError as exc:
+        raise SandboxError("Strategy source is nested too deeply.") from exc
+
+    for node in nodes:
         if isinstance(node, ast.Attribute):
-            attr = node.attr
-            if attr in _ALLOWED_TO_ATTRS:
-                continue
-            if attr in _FORBIDDEN_ATTRS or attr.startswith(_FORBIDDEN_ATTR_PREFIXES):
-                raise SandboxError(f"Disallowed attribute access: .{attr}")
+            _check_attr_name(node.attr)
+        elif isinstance(node, ast.MatchClass):
+            # `case pd.Series(__class__=c)` reads attributes without an ast.Attribute.
+            for kwd in node.kwd_attrs:
+                _check_attr_name(kwd)
         elif isinstance(node, ast.Name):
             if node.id in _FORBIDDEN_NAMES or node.id.startswith("__"):
                 raise SandboxError(f"Disallowed name: {node.id}")
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             raise SandboxError("global/nonlocal are not allowed.")
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if "__" in node.value:
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            text = node.value if isinstance(node.value, str) else node.value.decode("latin-1")
+            if "__" in text:
                 raise SandboxError("Dunder strings are not allowed.")
 
         if isinstance(node, ast.Import):
             for name in node.names:
-                if name.name.split(".")[0] not in _ALLOWED_IMPORTS:
+                if name.name not in _ALLOWED_IMPORTS:
                     raise SandboxError(f"Disallowed import: {name.name}")
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
-            if mod.split(".")[0] not in _ALLOWED_IMPORTS:
+            if node.level or mod not in _ALLOWED_IMPORTS:
                 raise SandboxError(f"Disallowed import from: {mod}")
+            for alias in node.names:
+                _check_attr_name(alias.name)
 
 
-def _safe_builtins() -> dict[str, Any]:
-    """Whitelist of builtins the strategy can call.
-
-    We allow the usual math primitives but drop `open`, `eval`, `exec`, `__import__`.
-    Numpy and pandas already give the strategy everything it needs.
-    """
-    import builtins
-
-    safe = {
-        name: getattr(builtins, name)
-        for name in (
-            "abs", "all", "any", "bool", "dict", "enumerate", "float", "int",
-            "len", "list", "map", "max", "min", "range", "round", "set",
-            "slice", "sorted", "str", "sum", "tuple", "zip", "isinstance",
-            "True", "False", "None",
-        )
-        if hasattr(builtins, name)
+def _encode_input(source: str, price_data: pd.Series | pd.DataFrame, timeout: float) -> bytes:
+    """Serialize inputs as plain numeric/unicode arrays (no pickle)."""
+    idx = price_data.index
+    arrays: dict[str, Any] = {
+        "source": np.frombuffer(source.encode("utf-8"), dtype=np.uint8),
+        "values": np.asarray(price_data.to_numpy(), dtype="float64"),
     }
-    return safe
-
-
-def _child_main(conn: Any, source: str, price_data: Any, timeout_seconds: float) -> None:
-    """Runs in a forked child: drop secrets, apply rlimits, exec, send result."""
-    import os
-
-    try:
-        # The child never needs credentials; scrub them so an escape can't read them.
-        for key in list(os.environ):
-            if any(m in key.upper() for m in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
-                del os.environ[key]
+    if isinstance(idx, pd.DatetimeIndex):
+        arrays["index_kind"] = np.array("datetime")
+        naive = idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
+        arrays["index"] = naive.to_numpy().astype("datetime64[ns]")
+        if idx.tz is not None:
+            arrays["tz"] = np.array(str(idx.tz))
+    elif isinstance(idx, pd.RangeIndex):
+        arrays["index_kind"] = np.array("range")
+        arrays["index"] = np.arange(len(idx))
+    else:
+        arrays["index_kind"] = np.array("other")
         try:
-            import resource
-
-            cpu = max(1, int(timeout_seconds) + 1)
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))  # no file writes
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            if sys.platform.startswith("linux"):
-                mem = 2 * 1024**3
-                resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-        except (ImportError, ValueError, OSError):
-            pass
-
-        namespace: dict[str, Any] = {"np": np, "pd": pd, "__builtins__": _safe_builtins()}
-        try:
-            exec(compile(source, "<strategy>", "exec"), namespace)  # noqa: S102
-        except Exception as exc:
-            conn.send(("err", f"Strategy failed to compile: {exc}"))
-            return
-        fn = namespace.get("strategy")
-        if not callable(fn):
-            conn.send(("err", "Strategy source did not define a callable `strategy`."))
-            return
-        try:
-            conn.send(("ok", fn(price_data)))
-        except Exception as exc:
-            conn.send(("err", f"Strategy raised: {exc}"))
-    except BaseException as exc:  # noqa: BLE001
-        try:
-            conn.send(("err", f"Strategy failed: {type(exc).__name__}"))
-        except Exception:
-            pass
-    finally:
-        conn.close()
+            arrays["index"] = np.asarray(idx.to_numpy(), dtype="float64")
+        except (TypeError, ValueError):
+            arrays["index"] = np.asarray([str(v) for v in idx], dtype="U")
+    if isinstance(price_data, pd.DataFrame):
+        arrays["columns"] = np.asarray([str(c) for c in price_data.columns], dtype="U")
+    buf = io.BytesIO()
+    np.savez(buf, **arrays, timeout=np.float64(timeout))
+    return buf.getvalue()
 
 
-def _run_isolated(source: str, price_data: Any, timeout_seconds: float) -> Any:
-    """Execute in a child process that the parent can hard-kill on timeout."""
-    import multiprocessing as mp
+def _run_isolated(source: str, price_data: Any, timeout_seconds: float) -> np.ndarray:
+    """Run in a fresh interpreter; hard-kill its process group on timeout."""
+    from pathlib import Path
 
-    if not hasattr(os, "fork"):
-        raise SandboxError("Isolated strategy execution requires a POSIX platform.")
-    ctx = mp.get_context("fork")
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(
-        target=_child_main, args=(child_conn, source, price_data, timeout_seconds), daemon=True
+    worker = Path(__file__).with_name("_sandbox_worker.py")
+    pkg_root = str(Path(__file__).resolve().parents[2])
+    payload = _encode_input(source, price_data, timeout_seconds)
+
+    # Minimal environment: nothing from the parent (API keys, tokens) is inherited.
+    env = {"PATH": "/usr/bin:/bin", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"}
+    posix = hasattr(os, "killpg")
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-I", str(worker), pkg_root],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        cwd=os.path.dirname(str(worker)) if not posix else "/",
+        start_new_session=posix,
     )
-    proc.start()
-    child_conn.close()
-    try:
-        if not parent_conn.poll(timeout_seconds):
-            raise SandboxError("Strategy exceeded the wall-clock timeout.")
+
+    timed_out = threading.Event()
+
+    def _kill() -> None:
+        timed_out.set()
         try:
-            status, payload = parent_conn.recv()
-        except (EOFError, OSError) as exc:
-            raise SandboxError("Strategy process died (resource limit or crash).") from exc
+            if posix:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    timer = threading.Timer(timeout_seconds, _kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        def _feed() -> None:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(payload)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        feeder = threading.Thread(target=_feed, daemon=True)
+        feeder.start()
+        assert proc.stdout is not None
+        data = proc.stdout.read(_MAX_OUTPUT_BYTES + 1)
     finally:
-        if proc.is_alive():
+        timer.cancel()
+        _kill_quiet(proc, posix)
+        proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+
+    if timed_out.is_set():
+        raise SandboxError("Strategy exceeded the wall-clock timeout.")
+    if len(data) > _MAX_OUTPUT_BYTES:
+        raise SandboxError("Strategy output too large.")
+    if not data:
+        raise SandboxError("Strategy process died (resource limit or crash).")
+    status, body = data[:1], data[1:]
+    if status == b"E":
+        raise SandboxError(body.decode("utf-8", "replace")[:2000])
+    if status != b"O":
+        raise SandboxError("Strategy process returned a malformed result.")
+    try:
+        with np.load(io.BytesIO(body), allow_pickle=False) as z:
+            return np.asarray(z["values"], dtype="float64")
+    except Exception as exc:  # noqa: BLE001
+        raise SandboxError("Strategy process returned a malformed result.") from exc
+
+
+def _kill_quiet(proc: subprocess.Popen, posix: bool) -> None:
+    """Kill any stragglers (including grandchildren) in the worker's process group."""
+    try:
+        if posix:
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif proc.poll() is None:
             proc.kill()
-        proc.join(timeout=5)
-        parent_conn.close()
-    if status != "ok":
-        raise SandboxError(str(payload))
-    return payload
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
